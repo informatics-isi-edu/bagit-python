@@ -38,7 +38,6 @@ import multiprocessing
 import optparse
 import os
 import re
-import signal
 import sys
 import tempfile
 from datetime import date
@@ -111,6 +110,8 @@ def make_bag(bag_dir, bag_info=None, processes=1, checksum=None):
             temp_data = tempfile.mkdtemp(dir=cwd)
 
             for f in os.listdir('.'):
+                if f == 'fetch.txt':
+                    continue
                 if os.path.abspath(f) == temp_data:
                     continue
                 new_f = os.path.join(temp_data, f)
@@ -167,6 +168,7 @@ class Bag(object):
         self.tags = {}
         self.info = {}
         self.entries = {}
+        self.remote_files = {}
         self.algs = []
         self.tag_file_name = None
         self.path = abspath(path)
@@ -223,15 +225,17 @@ class Bag(object):
             if isfile(f):
                 yield f
 
-    def compare_manifests_with_fs(self):
+    def compare_manifests_with_fs_and_fetch(self):
         files_on_fs = set(self.payload_files())
         files_in_manifest = set(self.payload_entries().keys())
+        files_in_fetch = set(self.files_to_be_fetched())
 
         if self.version == "0.97":
             files_in_manifest = files_in_manifest | set(self.missing_optional_tagfiles())
 
         return (list(files_in_manifest - files_on_fs),
-                list(files_on_fs - files_in_manifest))
+                list(files_on_fs - files_in_manifest),
+                list(files_in_fetch - files_in_manifest))
 
     def compare_fetch_with_fs(self):
         """Compares the fetch entries with the files actually
@@ -299,8 +303,11 @@ class Bag(object):
             oxum = None
             self.algs = list(set(self.algs))  # Dedupe
             for alg in self.algs:
+                # Generate new fetch.txt file, taking into account that one might already exist
+                logger.info('updating fetch.txt')
+                self._make_fetch_file(alg)
                 logger.info('updating manifest-%s.txt', alg)
-                oxum = _make_manifest('manifest-%s.txt' % alg, 'data', processes, alg)
+                oxum = _make_manifest('manifest-%s.txt' % alg, 'data', processes, alg, self.remote_files)
 
             # Update Payload-Oxum
             logger.info('updating %s', self.tag_file_name)
@@ -334,18 +341,30 @@ class Bag(object):
             if not os.path.isfile(os.path.join(self.path, tagfilepath)):
                 yield tagfilepath
 
-    def fetch_entries(self):
+    def fetch_entries(self, skip_header=True):
         fetch_file_path = os.path.join(self.path, "fetch.txt")
 
         if isfile(fetch_file_path):
             with open(fetch_file_path, 'rb') as fetch_file:
+                header_skipped = False
                 for line in fetch_file:
+                    if skip_header and not header_skipped:
+                        header_skipped = True
+                        continue
                     parts = line.strip().split(None, 2)
                     yield (parts[0], parts[1], parts[2])
 
     def files_to_be_fetched(self):
         for f, size, path in self.fetch_entries():
-            yield f
+            yield os.path.normpath(path)
+
+    def add_remote_file(self, url, length, filename, alg, digest):
+        if alg not in self.algs:
+            self.algs.append(alg)
+        if os.path.sep != '/':
+            parts = filename.split(os.path.sep)
+            filename = '/'.join(parts)
+        self.remote_files[filename] = {'url': url, 'length': int(length), 'alg': alg, 'digest': digest}
 
     def has_oxum(self):
         return 'Payload-Oxum' in self.info
@@ -413,6 +432,42 @@ class Bag(object):
                         self.entries[entry_path] = {}
                         self.entries[entry_path][alg] = entry_hash
 
+    def _make_fetch_file(self, alg):
+
+        if not self.remote_files:
+            return
+
+        fetch_file_path = os.path.join(self.path, "fetch.txt")
+        temp_fetch_file_path = '.'.join([fetch_file_path, 'tmp'])
+
+        if not isfile(fetch_file_path):
+            with open(fetch_file_path, 'w') as fetch_file:
+                fetch_file.write("URL\tLENGTH\tFILENAME\n")
+                for filename, values in self.remote_files.iteritems():
+                    fetch_file.write("%s\t%s\t%s\n" % (values['url'], values['length'], filename))
+            fetch_file.close()
+        else:
+            with open(temp_fetch_file_path, 'w') as fetch_file:
+                fetch_files = {}
+                payload_entries = self.payload_entries()
+                # fetch_files represents the union of any new remote files added programatically
+                # and any files that are found in pre-existing fetch.txt and manifest(s)
+                # any newly added remote file references take precedence over those in a pre-existing fetch.txt
+                for filename, values in self.remote_files.iteritems():
+                    fetch_files[filename] = {'url': values['url'], 'length': values['length']}
+                for url, length, filename in self.fetch_entries():
+                    if filename not in self.remote_files:
+                        fetch_files[filename] = {'url': url, 'length': length}
+                        entry_path = os.path.normpath(filename.lstrip("*"))
+                        if entry_path in payload_entries:
+                            self.add_remote_file(url, length, filename, alg, payload_entries[entry_path][alg])
+                fetch_file.write("URL\tLENGTH\tFILENAME\n")
+                for filename, values in fetch_files.iteritems():
+                    fetch_file.write("%s\t%s\t%s\n" % (values['url'], values['length'], filename))
+            fetch_file.close()
+            os.remove(fetch_file_path)
+            os.rename(temp_fetch_file_path, fetch_file_path)
+
     def _validate_structure(self):
         """Checks the structure of the bag, determining if it conforms to the
            BagIt spec. Returns true on success, otherwise it will raise
@@ -469,7 +524,7 @@ class Bag(object):
             total_files += 1
 
         if file_count != total_files or byte_count != total_bytes:
-            raise BagValidationError("Oxum error.  Found %s files and %s bytes on disk; expected %s files and %s bytes." % (total_files, total_bytes, file_count, byte_count))
+            raise BagIncompleteError(total_files, total_bytes, file_count, byte_count)
 
     def _validate_entries(self, processes):
         """
@@ -479,7 +534,7 @@ class Bag(object):
 
         # First we'll make sure there's no mismatch between the filesystem
         # and the list of files in the manifest(s)
-        only_in_manifests, only_on_fs = self.compare_manifests_with_fs()
+        only_in_manifests, only_on_fs, only_in_fetch = self.compare_manifests_with_fs_and_fetch()
         for path in only_in_manifests:
             e = FileMissing(path)
             logger.warning(str(e))
@@ -488,6 +543,11 @@ class Bag(object):
             e = UnexpectedFile(path)
             logger.warning(str(e))
             errors.append(e)
+        for path in only_in_fetch:
+            e = UnexpectedRemoteFile(path)
+            logger.warning(str(e))
+            # this is non-fatal according to spec but the warning is still reasonable
+            #errors.append(e)
 
         # To avoid the overhead of reading the file more than once or loading
         # potentially massive files into memory we'll create a dictionary of
@@ -505,9 +565,6 @@ class Bag(object):
         if not available_hashers:
             raise RuntimeError("%s: Unable to validate bag contents: none of the hash algorithms in %s are supported!" % (self, self.algs))
 
-        def _init_worker():
-            signal.signal(signal.SIGINT, signal.SIG_IGN)
-
         args = ((self.path, rel_path, hashes, available_hashers) for rel_path, hashes in list(self.entries.items()))
 
         try:
@@ -515,7 +572,7 @@ class Bag(object):
                 hash_results = list(map(_calc_hashes, args))
             else:
                 try:
-                    pool = multiprocessing.Pool(processes if processes else None, _init_worker)
+                    pool = multiprocessing.Pool(processes if processes else None)
                     hash_results = pool.map(_calc_hashes, args)
                 finally:
                     try:
@@ -571,6 +628,20 @@ class BagValidationError(BagError):
         return self.message
 
 
+class BagIncompleteError(BagError):
+    def __init__(self, total_files=None, total_bytes=None, file_count=None, byte_count=None):
+        super(BagIncompleteError, self).__init__()
+
+        self.total_files = total_files
+        self.total_bytes = total_bytes
+        self.file_count = file_count
+        self.byte_count = byte_count
+
+    def __str__(self):
+        return "Found %s files and %s bytes on disk; expected %s files and %s bytes." % \
+               (self.total_files, self.total_bytes, self.file_count, self.byte_count)
+
+
 class ManifestErrorDetail(BagError):
     def __init__(self, path):
         super(ManifestErrorDetail, self).__init__()
@@ -599,6 +670,11 @@ class FileMissing(ManifestErrorDetail):
 class UnexpectedFile(ManifestErrorDetail):
     def __str__(self):
         return "%s exists on filesystem but is not in manifest" % self.path
+
+
+class UnexpectedRemoteFile(ManifestErrorDetail):
+    def __str__(self):
+        return "%s exists in fetch.txt but is not in manifest" % self.path
 
 
 def _calc_hashes(args):
@@ -721,7 +797,7 @@ def _make_tag_file(bag_info_path, bag_info):
                 f.write("%s: %s\n" % (h, txt))
 
 
-def _make_manifest(manifest_file, data_dir, processes, algorithm='md5'):
+def _make_manifest(manifest_file, data_dir, processes, algorithm='md5', remote_files={}):
     logger.info('writing manifest with %s processes', processes)
 
     if algorithm == 'md5':
@@ -751,6 +827,14 @@ def _make_manifest(manifest_file, data_dir, processes, algorithm='md5'):
             num_files += 1
             total_bytes += byte_count
             manifest.write("%s  %s\n" % (digest, _encode_filename(filename)))
+
+        for filename, values in remote_files.iteritems():
+            if algorithm != values['alg']:
+                continue
+            num_files += 1
+            total_bytes += values['length']
+            manifest.write("%s  %s\n" % (values['digest'], _encode_filename(filename)))
+
         manifest.close()
         return "%s.%s" % (total_bytes, num_files)
 
@@ -934,6 +1018,10 @@ if __name__ == '__main__':
 
     _configure_logging(opts)
 
+    if not args:
+        logger.error("No bag directories specified - nothing to do")
+        sys.exit(1)
+
     rc = 0
     for bag_dir in args:
 
@@ -947,8 +1035,13 @@ if __name__ == '__main__':
                     logger.info("%s valid according to Payload-Oxum", bag_dir)
                 else:
                     logger.info("%s is valid", bag_dir)
+            except BagIncompleteError as e:
+                logger.warn("BagIncompleteError: %s %s", e,
+                            "\nThis validation error may be transient if the bag contains unresolved remote file "
+                            "references from a fetch.txt file. \nIn this case, the bag is incomplete but not "
+                            "necessarily invalid. Resolve remote file references (if any) and re-validate.")
             except BagError as e:
-                logger.info("%s is invalid: %s", bag_dir, e)
+                logger.error("%s is invalid: %s", bag_dir, e)
                 rc = 1
 
         # make the bag
@@ -957,7 +1050,7 @@ if __name__ == '__main__':
                 make_bag(bag_dir, bag_info=opt_parser.bag_info,
                          processes=opts.processes,
                          checksum=opts.checksum)
-            except Exception:
+            except Exception as e:
                 logger.info("%s failed to create: %s", bag_dir, e)
                 rc = 1
 
