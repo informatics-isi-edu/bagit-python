@@ -575,7 +575,7 @@ class Bag(object):
         if not available_hashers:
             raise RuntimeError("%s: Unable to validate bag contents: none of the hash algorithms in %s are supported!" % (self, self.algs))
 
-        args = ((self.path, rel_path, hashes, available_hashers) for rel_path, hashes in list(self.entries.items()))
+        args = ((self.path, rel_path, hashes, available_hashers) for rel_path, hashes in self.entries.items())
 
         try:
             if processes == 1:
